@@ -1,3 +1,11 @@
 {
-  "aliases": []
+  "aliases": [
+    {
+      "alias": "inbox and ticket management",
+      "ticketCode": "TCTTCT-5687",
+      "title": "Support Inbox / Ticket Management 2026",
+      "bookingMode": "favourite",
+      "notes": "Auto-learned from a successful natural-language booking."
+    }
+  ]
 }

@@ -19,6 +19,7 @@ export interface AutomationOptions {
   timeoutMs?: number;
   keepOpen?: boolean;
   debug?: boolean;
+  retryAttempts?: number;
 }
 
 const DEFAULT_BASE_URL = "https://portal.theconfigteam.co.uk";
@@ -34,6 +35,8 @@ type UiStepError =
 interface UiActionResult {
   success: boolean;
   error?: string;
+  screenshotPath?: string;
+  warning?: string;
 }
 
 type InteractionRoot = Page | Frame;
@@ -215,6 +218,14 @@ function formatUiError(step: UiStepError, detail?: string): string {
   return detail ? `${step}: ${detail}` : step;
 }
 
+async function captureDebugScreenshot(page: Page, label: string, debug: boolean): Promise<string | undefined> {
+  if (!debug) return undefined;
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const filePath = path.join(process.cwd(), `trs-debug-${label}-${ts}.png`);
+  await page.screenshot({ path: filePath, fullPage: true }).catch(() => undefined);
+  return filePath;
+}
+
 function getInteractionRoots(page: Page): InteractionRoot[] {
   return [page, ...page.frames()];
 }
@@ -353,7 +364,7 @@ async function findVisibleModal(page: Page): Promise<Locator | null> {
   return null;
 }
 
-async function openAddTimeModal(dayContainer: Locator, root: InteractionRoot, page: Page): Promise<Locator> {
+async function openAddTimeModal(dayContainer: Locator, root: InteractionRoot, page: Page): Promise<Locator | null> {
   const dateToken = compactDate(
     await dayContainer
       .evaluate((node) => node.getAttribute("data-date") ?? node.getAttribute("data-day") ?? "")
@@ -398,7 +409,7 @@ async function openAddTimeModal(dayContainer: Locator, root: InteractionRoot, pa
     }
   }
 
-  throw new Error(formatUiError("add_time_modal_not_found", "Could not open the Add Time modal."));
+  return null;
 }
 
 async function waitForAddTimeModal(page: Page): Promise<Locator | null> {
@@ -583,19 +594,31 @@ async function selectTicketViaSearch(page: Page, modal: Locator, ticketCode: str
       await searchToggle.click().catch(() => undefined);
     });
   }
-  await page.waitForTimeout(500);
 
-  const searchInput = await findFirstVisibleLocator(page, [
+  // Wait for the search input to become visible after the radio toggle
+  const searchInputSelectors = [
     "#txt_tr_sch",
     "input[id='txt_tr_sch']",
     "input[name='txt_tr_sch']",
     "input[id*='txt_tr_sch']",
     "input[name*='txt_tr_sch']",
-  ]);
-  if (!searchInput || (await searchInput.count()) === 0) {
+  ];
+  let searchInput: Locator | null = null;
+  const visibilityDeadline = Date.now() + 5_000;
+  while (Date.now() < visibilityDeadline) {
+    searchInput = await findFirstVisibleLocator(page, searchInputSelectors);
+    if (searchInput && (await searchInput.isVisible().catch(() => false))) break;
+    searchInput = null;
+    await page.waitForTimeout(200);
+  }
+
+  if (!searchInput) {
     return {
       success: false,
-      error: formatUiError("ticket_picker_not_found", "Search input was not found in the Add Time modal."),
+      error: formatUiError(
+        "ticket_picker_not_found",
+        `Search input not found after toggling search radio. Tried selectors: #txt_tr_sch, input[name='txt_tr_sch'], input[id*='txt_tr_sch'], input[name*='txt_tr_sch']. Page URL: ${page.url()}`,
+      ),
     };
   }
 
@@ -702,6 +725,8 @@ async function selectTicket(
 }
 
 async function fillTinyMceComment(page: Page, modal: Locator, text: string): Promise<UiActionResult> {
+  let fillAttempted = false;
+
   const iframeLocator =
     (await findFirstVisibleLocator(page, [
       "#txt_tr_comments_ifr",
@@ -716,6 +741,7 @@ async function fillTinyMceComment(page: Page, modal: Locator, text: string): Pro
     if (frame) {
       const body = frame.locator("body");
       await body.waitFor({ state: "visible", timeout: 10_000 }).catch(() => undefined);
+      fillAttempted = true;
       await body.fill(text).catch(() => undefined);
       const bodyText = (await body.innerText().catch(() => "")).trim();
       if (bodyText.toLowerCase().includes(text.toLowerCase())) {
@@ -727,6 +753,7 @@ async function fillTinyMceComment(page: Page, modal: Locator, text: string): Pro
   for (const root of getInteractionRoots(page)) {
     const editorBody = root.locator("body#tinymce, body.mce-content-body, body[contenteditable='true']").first();
     if ((await editorBody.count()) > 0 && (await editorBody.isVisible().catch(() => false))) {
+      fillAttempted = true;
       await editorBody.fill(text).catch(() => undefined);
       const bodyText = (await editorBody.innerText().catch(() => "")).trim();
       if (bodyText.toLowerCase().includes(text.toLowerCase())) {
@@ -736,8 +763,10 @@ async function fillTinyMceComment(page: Page, modal: Locator, text: string): Pro
   }
 
   return {
-    success: false,
-    error: formatUiError("comment_editor_not_found", "TinyMCE comment iframe was not found."),
+    success: true,
+    warning: fillAttempted
+      ? formatUiError("comment_editor_not_found", "TinyMCE fill was attempted but content readback did not confirm it was set. Verify comment in TRS.")
+      : formatUiError("comment_editor_not_found", "TinyMCE comment editor was not found; comment was not set. Verify in TRS."),
   };
 }
 
@@ -867,7 +896,10 @@ async function submitAddTimeModal(page: Page, modal: Locator): Promise<UiActionR
   if ((await submitButton.count()) === 0) {
     return {
       success: false,
-      error: formatUiError("submit_failed", "Could not find the Add Time submit button."),
+      error: formatUiError(
+        "submit_failed",
+        `Submit button not found. Tried selectors: #openTime_Add, button#openTime_Add, button:has-text('Add Time'), input[value='Add Time'], input[type='submit'][value='Add Time']. Page URL: ${page.url()}`,
+      ),
     };
   }
 
@@ -882,7 +914,23 @@ async function submitAddTimeModal(page: Page, modal: Locator): Promise<UiActionR
   return { success: true };
 }
 
-async function addEntryToPage(page: Page, entry: TimeEntry): Promise<UiActionResult> {
+async function withRetry<T>(
+  attempts: number,
+  fn: () => Promise<T>,
+  shouldRetry: (result: T) => boolean,
+): Promise<T> {
+  let last!: T;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    last = await fn();
+    if (!shouldRetry(last)) return last;
+    if (attempt < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+    }
+  }
+  return last;
+}
+
+async function addEntryToPage(page: Page, entry: TimeEntry, debug: boolean, retries: number): Promise<UiActionResult> {
   try {
     const root = await findTimeRecordingRoot(page);
     const { container } = await findDayContext(root, page, entry);
@@ -893,8 +941,10 @@ async function addEntryToPage(page: Page, entry: TimeEntry): Promise<UiActionRes
       ].join(", "),
     );
 
-    const modal =
-      (await (async () => {
+    // Open modal with retry
+    const modal = await withRetry(
+      retries,
+      async () => {
         if ((await datedButton.count()) > 0) {
           const button = datedButton.first();
           await button.scrollIntoViewIfNeeded().catch(() => undefined);
@@ -905,41 +955,70 @@ async function addEntryToPage(page: Page, entry: TimeEntry): Promise<UiActionRes
               });
             });
           });
-          return await waitForAddTimeModal(page);
+          return waitForAddTimeModal(page);
         }
-        return null;
-      })()) ?? (await openAddTimeModal(container, root, page));
+        return openAddTimeModal(container, root, page);
+      },
+      (result) => result === null,
+    );
 
-    const ticketResult = await selectTicket(modal, page, entry.ticketId, entry.description, entry.bookingMode);
+    if (!modal) {
+      const screenshotPath = await captureDebugScreenshot(page, "modal-open-failed", debug);
+      return {
+        success: false,
+        screenshotPath,
+        error: formatUiError(
+          "add_time_modal_not_found",
+          `Could not open the Add Time modal after ${retries} attempt(s). Tried ${
+            (await datedButton.count()) > 0 ? "dated button then " : ""
+          }Add Time button candidates. Page URL: ${page.url()}`,
+        ),
+      };
+    }
+
+    // Select ticket with retry
+    const ticketResult = await withRetry(
+      retries,
+      () => selectTicket(modal, page, entry.ticketId, entry.description, entry.bookingMode),
+      (result) => !result.success,
+    );
     if (!ticketResult.success) {
-      return ticketResult;
+      const screenshotPath = await captureDebugScreenshot(page, "ticket-selection-failed", debug);
+      return { ...ticketResult, screenshotPath };
     }
 
     const duration = await findDurationInput(page, modal);
     if (!duration || (await duration.count()) === 0) {
+      const screenshotPath = await captureDebugScreenshot(page, "duration-not-found", debug);
       return {
         success: false,
-        error: formatUiError("submit_failed", "Duration input (#txt_tr_duration) was not found."),
+        screenshotPath,
+        error: formatUiError("submit_failed", `Duration input (#txt_tr_duration) was not found. Page URL: ${page.url()}`),
       };
     }
     await duration.fill(formatHourValue(entry.hours));
 
+    // TinyMCE: collect warning, never abort
     const commentResult = await fillTinyMceComment(page, modal, entry.description);
-    if (!commentResult.success) {
-      return commentResult;
-    }
+    const commentWarning = commentResult.warning;
 
     const submitResult = await submitAddTimeModal(page, modal);
     if (!submitResult.success) {
-      return submitResult;
+      const screenshotPath = await captureDebugScreenshot(page, "submit-failed", debug);
+      return { ...submitResult, screenshotPath };
     }
 
     const modalClosed = await waitForModalToClose(modal, page);
     if (!modalClosed) {
       const validationText = await extractVisibleValidationText(modal);
+      const screenshotPath = await captureDebugScreenshot(page, "modal-not-closed", debug);
       return {
         success: false,
-        error: formatUiError("submit_failed", validationText ?? "The Add Time modal did not close after submit."),
+        screenshotPath,
+        error: formatUiError(
+          "submit_failed",
+          (validationText ?? "The Add Time modal did not close after submit.") + ` | Page URL: ${page.url()}`,
+        ),
       };
     }
 
@@ -947,26 +1026,31 @@ async function addEntryToPage(page: Page, entry: TimeEntry): Promise<UiActionRes
     const rowDetectedInDay = await detectEntryRow(container, entry).catch(() => false);
     const rowDetectedAnywhere = rowDetectedInDay ? true : await detectEntryRowAnywhere(page, entry);
     const pageMessages = await extractPageMessages(root).catch(() => undefined);
+    const screenshotPath = await captureDebugScreenshot(page, "post-submit", debug);
 
-    if (!rowDetectedAnywhere) {
-      return {
-        success: false,
-        error: formatUiError(
+    const rowWarning = !rowDetectedAnywhere
+      ? formatUiError(
           "entry_row_not_detected",
           pageMessages
-            ? `No new row containing '${entry.ticketId || entry.description}' was detected after submit. Visible page messages: ${pageMessages}`
-            : `No new row containing '${entry.ticketId || entry.description}' was detected after submit. The modal closed, so please verify in TRS whether the save succeeded.`,
-        ),
-      };
-    }
+            ? `No new row for '${entry.ticketId || entry.description}' detected. Page messages: ${pageMessages}`
+            : `No new row for '${entry.ticketId || entry.description}' detected. Modal closed — verify in TRS that the entry was saved.`,
+        )
+      : undefined;
+
+    const allWarnings = [commentWarning, rowWarning, pageMessages && !rowWarning ? `post_submit_note: ${pageMessages}` : undefined]
+      .filter(Boolean)
+      .join(" | ");
 
     return {
       success: true,
-      error: pageMessages ? `post_submit_note: ${pageMessages}` : undefined,
+      screenshotPath,
+      warning: allWarnings || undefined,
     };
   } catch (err) {
+    const screenshotPath = await captureDebugScreenshot(page, "uncaught-error", debug);
     return {
       success: false,
+      screenshotPath,
       error: err instanceof Error ? err.message : formatUiError("submit_failed", String(err)),
     };
   }
@@ -975,17 +1059,19 @@ async function addEntryToPage(page: Page, entry: TimeEntry): Promise<UiActionRes
 export async function addTimeEntriesViaUi(
   entries: TimeEntry[],
   options: AutomationOptions = {},
-): Promise<{ success: boolean; results: Array<{ entry: TimeEntry; success: boolean; error?: string }> }> {
+): Promise<{ success: boolean; results: Array<{ entry: TimeEntry; success: boolean; error?: string; warning?: string; screenshotPath?: string }> }> {
   const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+  const debug = options.debug ?? false;
+  const retries = Math.max(1, options.retryAttempts ?? 2);
 
   const { context, page } = await launchEdge(options);
   try {
     await waitForLogin(page, baseUrl);
     await ensureOnEditTimePage(page, baseUrl);
 
-    const results: Array<{ entry: TimeEntry; success: boolean; error?: string }> = [];
+    const results: Array<{ entry: TimeEntry; success: boolean; error?: string; warning?: string; screenshotPath?: string }> = [];
     for (const entry of entries) {
-      const result = await addEntryToPage(page, entry);
+      const result = await addEntryToPage(page, entry, debug, retries);
       results.push({ entry, ...result });
     }
 

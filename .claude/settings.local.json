@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /c/Dev/trs-mcp/src/*.ts)",
+      "Bash(npm run:*)",
+      "Bash(node build/index.js)",
+      "Bash(printf '%s\\\\n%s\\\\n%s\\\\n' '{\"\"\"\"jsonrpc\"\"\"\":\"\"\"\"2.0\"\"\"\",\"\"\"\"id\"\"\"\":1,\"\"\"\"method\"\"\"\":\"\"\"\"initialize\"\"\"\",\"\"\"\"params\"\"\"\":{\"\"\"\"protocolVersion\"\"\"\":\"\"\"\"2024-11-05\"\"\"\",\"\"\"\"capabilities\"\"\"\":{},\"\"\"\"clientInfo\"\"\"\":{\"\"\"\"name\"\"\"\":\"\"\"\"test\"\"\"\",\"\"\"\"version\"\"\"\":\"\"\"\"1\"\"\"\"}}}' '{\"\"\"\"jsonrpc\"\"\"\":\"\"\"\"2.0\"\"\"\",\"\"\"\"method\"\"\"\":\"\"\"\"notifications/initialized\"\"\"\",\"\"\"\"params\"\"\"\":{}}' '{\"\"\"\"jsonrpc\"\"\"\":\"\"\"\"2.0\"\"\"\",\"\"\"\"id\"\"\"\":2,\"\"\"\"method\"\"\"\":\"\"\"\"tools/call\"\"\"\",\"\"\"\"params\"\"\"\":{\"\"\"\"name\"\"\"\":\"\"\"\"book_time_from_activity\"\"\"\",\"\"\"\"arguments\"\"\"\":{\"\"\"\"activity\"\"\"\":\"\"\"\"inbox and ticket management\"\"\"\",\"\"\"\"hours\"\"\"\":0.5,\"\"\"\"date\"\"\"\":\"\"\"\"2026-03-19\"\"\"\",\"\"\"\"auto_learn_alias\"\"\"\":false}}}')",
+      "Bash(TRS_USE_UI_AUTOMATION=true node build/index.js)",
+      "Bash(TRS_USE_UI_AUTOMATION=true TRS_DEBUG=true node build/index.js)",
+      "Bash(printf '%s\\\\n%s\\\\n%s\\\\n' '{\"\"\"\"jsonrpc\"\"\"\":\"\"\"\"2.0\"\"\"\",\"\"\"\"id\"\"\"\":1,\"\"\"\"method\"\"\"\":\"\"\"\"initialize\"\"\"\",\"\"\"\"params\"\"\"\":{\"\"\"\"protocolVersion\"\"\"\":\"\"\"\"2024-11-05\"\"\"\",\"\"\"\"capabilities\"\"\"\":{},\"\"\"\"clientInfo\"\"\"\":{\"\"\"\"name\"\"\"\":\"\"\"\"test\"\"\"\",\"\"\"\"version\"\"\"\":\"\"\"\"1\"\"\"\"}}}' '{\"\"\"\"jsonrpc\"\"\"\":\"\"\"\"2.0\"\"\"\",\"\"\"\"method\"\"\"\":\"\"\"\"notifications/initialized\"\"\"\",\"\"\"\"params\"\"\"\":{}}' '{\"\"\"\"jsonrpc\"\"\"\":\"\"\"\"2.0\"\"\"\",\"\"\"\"id\"\"\"\":2,\"\"\"\"method\"\"\"\":\"\"\"\"tools/call\"\"\"\",\"\"\"\"params\"\"\"\":{\"\"\"\"name\"\"\"\":\"\"\"\"book_time_from_activity\"\"\"\",\"\"\"\"arguments\"\"\"\":{\"\"\"\"activity\"\"\"\":\"\"\"\"inbox and ticket management\"\"\"\",\"\"\"\"hours\"\"\"\":1}}}')"
+    ]
+  }
+}
