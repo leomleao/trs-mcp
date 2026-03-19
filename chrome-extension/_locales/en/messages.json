@@ -1,0 +1,12 @@
+{
+	"extension_name": {
+		"message": "TRS on Steroids"
+	},
+	"extension_description": {
+		"message": "TRS requires resources to implement new features, this gives it steroids."
+	},
+
+	"page_not_loaded": {
+		"message": "The page is not loaded."
+	}
+}

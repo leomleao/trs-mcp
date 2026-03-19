@@ -1,0 +1,7 @@
+{
+  "template1": "<p>Hello {{ personName }},</p><p>Please could you provide an update with regards to our email sent on {{ lastCommentDate }}. Please find the original email attached.</p><p>{{ lastComment }}</p><p>Please note that we are implementing a 3-strike rule. If we do not receive any feedback from you after three follow-up attempts, we will proceed with the ticket closure. You may raise a new ticket if you still encounter the same issue.</p><p>Kind regards,</p><p>SAP AMS Team @ TCT</p>",
+
+  "template2": "<p>Hello {{ personName }},</p><p>Please could you provide an update with regards to our email sent on {{ lastCommentDate }}.</p><p>We also requested an update on {{ previousToLastCommentDate }}. Please find the original email attached.</p><p>Please could you respond to this email by {{ todayPlusDays(3) }}. If we receive no response, we will proceed to close the ticket.</p><p>If you have any further issues relating to this ticket, please raise a new ticket via the normal procedure. This will then be triaged and assigned to a Support Consultant for further investigation.</p><p>Please find the original email attached.</p><p>{{ lastComment }}</p><p>Many thanks &amp; Kind regards</p><p>SAP AMS Team @ TCT</p>",
+
+  "template3": "<p><strong>Notification of automatic ticket closure</strong></p><p>Please note that this ticket has been automatically closed, as notified previously, since no response has been received. Please raise a new ticket for any issues or service requests.</p><p>Many thanks</p><p>Kind regards,<br>SAP AMS Team @ TCT</p>"
+}
