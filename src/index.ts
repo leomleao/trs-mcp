@@ -408,18 +408,23 @@ server.registerTool(
         keepOpen: false,
       });
 
-      const commentCount = ticketContext.comments.length;
-      const summary = `Retrieved context for ticket ${ticket_id}: "${ticketContext.general.title}". ${commentCount} comment(s) found.`;
+      const data = {
+        ticket_id: ticketContext.ticketId,
+        url: ticketContext.url,
+        general: ticketContext.general,
+        comments: ticketContext.comments,
+        linked_tickets: ticketContext.linkedTickets,
+      };
 
-      return formatToolResult(
-        {
-          ticket_id: ticketContext.ticketId,
-          url: ticketContext.url,
-          general: ticketContext.general,
-          comments: ticketContext.comments,
-        },
-        summary,
-      );
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(data, null, 2),
+          },
+        ],
+        structuredContent: data,
+      };
     } catch (error) {
       console.error("Failed to get ticket context", {
         ticketId: ticket_id,

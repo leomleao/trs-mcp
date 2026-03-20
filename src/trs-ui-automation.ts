@@ -1252,17 +1252,17 @@ async function findTicketFrame(page: Page): Promise<Frame | null> {
       const count = await frame.locator("#tabGeneral").count().catch(() => 0);
       if (count > 0) return frame;
     }
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(100);
   }
   return null;
 }
 
-async function extractLinkedTicketIds(ticketFrame: Frame, page: Page): Promise<string[]> {
+async function extractLinkedTicketIds(ticketFrame: Frame): Promise<string[]> {
   // Tab label includes the count, e.g. "Links (4)" — match loosely
   const linksTab = ticketFrame.locator("[role='tab']").filter({ hasText: /Links/i }).first();
   if ((await linksTab.count()) > 0) {
     await linksTab.click();
-    await page.waitForTimeout(1500);
+    await ticketFrame.locator("#udp_Links_HD").waitFor({ timeout: 10_000 }).catch(() => undefined);
   }
 
   return ticketFrame.evaluate((): string[] => {
@@ -1304,7 +1304,6 @@ async function extractSingleTicketContext(
 
   const ticketUrl = `${baseUrl}/hd/${ticketId}`;
   await page.goto(ticketUrl, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(2000);
 
   if (page.url().includes("action=login")) {
     console.log(`Please log in to the TRS portal, then navigate to: ${ticketUrl}`);
@@ -1312,7 +1311,6 @@ async function extractSingleTicketContext(
     await readLine("");
     if (!page.url().startsWith(ticketUrl)) {
       await page.goto(ticketUrl, { waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(2000);
     }
   }
 
@@ -1369,7 +1367,6 @@ async function extractSingleTicketContext(
   const commentsTab = ticketFrame.locator("[role='tab']").filter({ hasText: /^Comments$/i }).first();
   if ((await commentsTab.count()) > 0) {
     await commentsTab.click();
-    await page.waitForTimeout(1500);
   }
   await ticketFrame.locator("#udp_Comments").waitFor({ timeout: 15_000 }).catch(() => undefined);
 
@@ -1412,7 +1409,7 @@ async function extractSingleTicketContext(
   });
 
   // Extract linked ticket IDs, then recurse into unvisited ones
-  const linkedIds = await extractLinkedTicketIds(ticketFrame, page);
+  const linkedIds = await extractLinkedTicketIds(ticketFrame);
   console.error(`[get_ticket_context] ${ticketId} → linked: [${linkedIds.join(", ") || "none"}]`);
 
   const linkedTickets: TicketContext[] = [];
