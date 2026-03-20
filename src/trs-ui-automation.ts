@@ -1486,6 +1486,115 @@ async function extractSingleTicketContext(
   return { ticketId, url: ticketUrl, general, comments, time, linkedTickets };
 }
 
+export interface WorklistItem {
+  priority: string;
+  client: string;
+  nextSlaDate: string;
+  ticketId: string;
+  externalId: string;
+  title: string;
+  type: string;
+  nextContactDate: string;
+  status: string;
+  deliveryDate: string;
+  lastComment: string;
+  owner: string;
+  assignedTo: string;
+  project: string;
+  module: string;
+}
+
+async function findWorklistRoot(page: Page): Promise<InteractionRoot> {
+  // Prefer the root that has the reports select
+  for (const root of getInteractionRoots(page)) {
+    const count = await root.locator("#cphB_ddlReports").count().catch(() => 0);
+    if (count > 0) return root;
+  }
+  return page;
+}
+
+export async function getMyWorklistViaUi(options: AutomationOptions = {}): Promise<WorklistItem[]> {
+  const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+  const { context, page } = await launchEdge(options);
+
+  try {
+    await waitForLogin(page, baseUrl);
+
+    const root = await findWorklistRoot(page);
+
+    // Select "My Worklist" report
+    const reportSelect = root.locator("#cphB_ddlReports").first();
+    await reportSelect.selectOption("My Worklist");
+    await page.waitForTimeout(300);
+
+    // Click Run Report
+    const runButton = root.locator("#cphB_butRunReport").first();
+    await runButton.click();
+
+    // Wait for the results table to appear
+    await page.waitForSelector("#cphB_gv_My_Worklist tbody tr", { timeout: 30_000 }).catch(() => undefined);
+    await page.waitForLoadState("networkidle").catch(() => undefined);
+
+    // Extract table data
+    const items = await page.evaluate((): WorklistItem[] => {
+      const table = document.querySelector("#cphB_gv_My_Worklist");
+      if (!table) return [];
+
+      const rows = table.querySelectorAll("tbody tr");
+      const results: WorklistItem[] = [];
+
+      for (const row of rows) {
+        const cells = row.querySelectorAll("td");
+        if (cells.length < 14) continue;
+
+        function cellText(index: number): string {
+          const cell = cells[index] as HTMLElement | undefined;
+          if (!cell) return "";
+          return (cell.innerText ?? "").replace(/\u00a0/g, "").trim();
+        }
+
+        // Priority is in a span inside the first cell
+        const prioritySpan = cells[0]?.querySelector("span[class*='priority_']") as HTMLElement | null;
+        const priority = prioritySpan ? (prioritySpan.innerText ?? "").trim() : cellText(0);
+
+        // Ticket ID is in the anchor link inside the hd_id cell
+        const ticketLink = cells[3]?.querySelector("a.dropdown_link") as HTMLElement | null;
+        const ticketId = ticketLink ? (ticketLink.innerText ?? "").trim() : cellText(3);
+
+        // Last comment date is in an anchor
+        const commentLink = cells[10]?.querySelector("a.comment") as HTMLElement | null;
+        const lastComment = commentLink ? (commentLink.innerText ?? "").replace(/\s+/g, " ").trim() : cellText(10);
+
+        results.push({
+          priority,
+          client: cellText(1),
+          nextSlaDate: cellText(2),
+          ticketId,
+          externalId: cellText(4),
+          title: cellText(5),
+          type: cellText(6),
+          nextContactDate: cellText(7),
+          status: cellText(8),
+          deliveryDate: cellText(9),
+          lastComment,
+          owner: cellText(11),
+          assignedTo: cellText(12),
+          project: cellText(13),
+          module: cellText(14),
+        });
+      }
+
+      return results;
+    });
+
+    return items;
+  } finally {
+    if (!options.keepOpen) {
+      await context.close();
+    }
+  }
+}
+
 export async function getTicketContextViaUi(
   ticketId: string,
   options: AutomationOptions = {},

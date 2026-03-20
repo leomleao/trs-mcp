@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { addTimeEntriesViaUi, getTicketContextViaUi } from "./trs-ui-automation.js";
+import { addTimeEntriesViaUi, getMyWorklistViaUi, getTicketContextViaUi } from "./trs-ui-automation.js";
 import { autoLearnAlias, resolveBookingSelection } from "./trs-ticket-mappings.js";
 
 const TRS_BASE_URL = process.env.TRS_BASE_URL ?? "https://portal.theconfigteam.co.uk/api";
@@ -431,6 +431,39 @@ server.registerTool(
         error: error instanceof Error ? error.message : String(error),
       });
       return formatToolError(error instanceof Error ? error.message : "Failed to get ticket context.");
+    }
+  },
+);
+
+server.registerTool(
+  "get_my_worklist",
+  {
+    title: "Get My Worklist",
+    description:
+      "Run the 'My Worklist' report in TRS and return all tickets currently assigned to or owned by the current user. Returns structured data including ticket ID, client, priority, status, type, dates, owner, and module.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const items = await getMyWorklistViaUi({
+        baseUrl: TRS_BASE_URL.replace(/\/api\/?$/, ""),
+        keepOpen: false,
+      });
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(items, null, 2),
+          },
+        ],
+        structuredContent: { items },
+      };
+    } catch (error) {
+      console.error("Failed to get My Worklist", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return formatToolError(error instanceof Error ? error.message : "Failed to get My Worklist.");
     }
   },
 );
