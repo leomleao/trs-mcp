@@ -860,42 +860,6 @@ async function countEntryRows(page: Page, entry: TimeEntry): Promise<number> {
   return maxCount;
 }
 
-async function detectEntryRow(dayContainer: Locator, entry: TimeEntry): Promise<boolean> {
-  const patterns = [entry.ticketId, entry.description];
-
-  for (const pattern of patterns) {
-    const trimmed = pattern.trim();
-    if (!trimmed) {
-      continue;
-    }
-    const candidate = dayContainer.getByText(trimmed, { exact: false }).first();
-    if ((await candidate.count()) > 0 && (await candidate.isVisible().catch(() => false))) {
-      return true;
-    }
-  }
-
-  const bodyText = (await dayContainer.innerText().catch(() => "")).toLowerCase();
-  return patterns.some((pattern) => pattern.trim() && bodyText.includes(pattern.trim().toLowerCase()));
-}
-
-async function detectEntryRowAnywhere(page: Page, entry: TimeEntry): Promise<boolean> {
-  const patterns = [entry.ticketId, entry.description]
-    .map((pattern) => pattern.trim().toLowerCase())
-    .filter(Boolean);
-
-  if (patterns.length === 0) {
-    return false;
-  }
-
-  for (const root of getInteractionRoots(page)) {
-    const text = (await root.locator("body").innerText().catch(() => "")).toLowerCase();
-    if (patterns.some((pattern) => text.includes(pattern))) {
-      return true;
-    }
-  }
-
-  return false;
-}
 
 async function submitAddTimeModal(page: Page, modal: Locator): Promise<UiActionResult> {
   const submitButton =
@@ -1251,6 +1215,235 @@ async function addEntriesBatch(page: Page, entries: TimeEntry[], debug: boolean,
   }
 
   return results;
+}
+
+export interface TicketGeneralInfo {
+  title: string;
+  details: string;
+  loggedBy: string;
+  clientLocation: string;
+  serviceType: string;
+  externalId: string;
+  clientProject: string;
+  reportedBy: string;
+  clientContact: string;
+  priority: string;
+}
+
+export interface TicketComment {
+  date: string | null;
+  commentBy: string;
+  context: "Customer facing" | "Internal" | "Work note";
+  content: string;
+}
+
+export interface TicketContext {
+  ticketId: string;
+  url: string;
+  general: TicketGeneralInfo;
+  comments: TicketComment[];
+  linkedTickets: TicketContext[];
+}
+
+async function findTicketFrame(page: Page): Promise<Frame | null> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    for (const frame of page.frames()) {
+      const count = await frame.locator("#tabGeneral").count().catch(() => 0);
+      if (count > 0) return frame;
+    }
+    await page.waitForTimeout(500);
+  }
+  return null;
+}
+
+async function extractLinkedTicketIds(ticketFrame: Frame, page: Page): Promise<string[]> {
+  // Tab label includes the count, e.g. "Links (4)" — match loosely
+  const linksTab = ticketFrame.locator("[role='tab']").filter({ hasText: /Links/i }).first();
+  if ((await linksTab.count()) > 0) {
+    await linksTab.click();
+    await page.waitForTimeout(1500);
+  }
+
+  return ticketFrame.evaluate((): string[] => {
+    const seen = new Set<string>();
+    const TICKET_RE = /^[A-Z]+-\d+$/;
+
+    // Primary: the HD links table — first <td> of each row is the ticket ID text
+    const hdLinksTable = document.querySelector("#udp_Links_HD");
+    if (hdLinksTable) {
+      for (const row of hdLinksTable.querySelectorAll("tbody tr")) {
+        const firstCell = row.querySelector("td");
+        const text = (firstCell as HTMLElement | null)?.innerText?.trim() ?? "";
+        if (TICKET_RE.test(text)) seen.add(text.toUpperCase());
+      }
+    }
+
+    // Fallback: scan the active panel for any element whose innerText is exactly a ticket ID
+    if (seen.size === 0) {
+      const root =
+        document.querySelector('[role="tabpanel"]:not([aria-hidden="true"])') ?? document;
+      for (const el of root.querySelectorAll("td, span, div")) {
+        const text = ((el as HTMLElement).innerText ?? "").trim();
+        if (TICKET_RE.test(text)) seen.add(text.toUpperCase());
+      }
+    }
+
+    return [...seen];
+  });
+}
+
+async function extractSingleTicketContext(
+  page: Page,
+  ticketId: string,
+  baseUrl: string,
+  visited: Set<string>,
+): Promise<TicketContext> {
+  visited.add(ticketId.toUpperCase());
+  console.error(`[get_ticket_context] extracting ${ticketId} (visited: ${[...visited].join(", ")})`);
+
+  const ticketUrl = `${baseUrl}/hd/${ticketId}`;
+  await page.goto(ticketUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(2000);
+
+  if (page.url().includes("action=login")) {
+    console.log(`Please log in to the TRS portal, then navigate to: ${ticketUrl}`);
+    console.log("Press ENTER once you are on the ticket page.");
+    await readLine("");
+    if (!page.url().startsWith(ticketUrl)) {
+      await page.goto(ticketUrl, { waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(2000);
+    }
+  }
+
+  const ticketFrame = await findTicketFrame(page);
+  if (!ticketFrame) {
+    throw new Error(`Could not find ticket content frame for ${ticketId}. Page URL: ${page.url()}`);
+  }
+
+  const general = await ticketFrame.evaluate((): TicketGeneralInfo => {
+    function getSelectText(id: string): string {
+      const el = document.querySelector(`#${id}`) as HTMLSelectElement | null;
+      if (!el || el.selectedIndex < 0) return "";
+      return el.options[el.selectedIndex]?.text.trim() ?? "";
+    }
+
+    function getInputValue(id: string): string {
+      const el = document.querySelector(`#${id}`) as HTMLInputElement | null;
+      return el ? el.value.trim() : "";
+    }
+
+    function getSpanText(id: string): string {
+      const el = document.querySelector(`#${id}`) as HTMLElement | null;
+      return el ? el.innerText.trim() : "";
+    }
+
+    function cleanHtml(html: string): string {
+      return html
+        .replace(/<p>/gi, "")
+        .replace(/<\/p>/gi, "\n")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/&nbsp;/g, " ")
+        .replace(/<[^>]+>/g, "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+    }
+
+    const detailsEl = document.querySelector("#txt_ed_details") as HTMLTextAreaElement | null;
+    const rawDetails = detailsEl ? detailsEl.value : "";
+
+    return {
+      title: getInputValue("txt_ed_title"),
+      details: cleanHtml(rawDetails),
+      loggedBy: getSpanText("lbl_ed_logged_by2"),
+      clientLocation: getSelectText("ddl_ed_client_loc_id"),
+      serviceType: getSelectText("ddl_ed_service_type"),
+      externalId: getInputValue("txt_ed_external_id"),
+      clientProject: getSelectText("ddl_ed_project_id"),
+      reportedBy: getInputValue("txt_ed_reported_by"),
+      clientContact: getSelectText("ddl_ed_client_contact"),
+      priority: getSelectText("ddl_ed_priority"),
+    };
+  });
+
+  const commentsTab = ticketFrame.locator("[role='tab']").filter({ hasText: /^Comments$/i }).first();
+  if ((await commentsTab.count()) > 0) {
+    await commentsTab.click();
+    await page.waitForTimeout(1500);
+  }
+  await ticketFrame.locator("#udp_Comments").waitFor({ timeout: 15_000 }).catch(() => undefined);
+
+  const comments = await ticketFrame.evaluate((): TicketComment[] => {
+    const container = document.querySelector("#udp_Comments");
+    if (!container) return [];
+
+    return [...container.querySelectorAll("fieldset.mnu_box_page")].map((fs) => {
+      const legend = fs.querySelector("legend") as HTMLElement | null;
+      let legendText = legend ? legend.innerText.trim() : "";
+      legendText = legendText.replace(/\s*Edit Comment.*$/, "").trim();
+
+      const legendMatch = legendText.match(/^(.+?)\s*-\s*([\d/]+\s*[\d:]+)\s*(\((IO|WN)\))?/);
+
+      let commentBy = "";
+      let date: string | null = null;
+      let commentContext: "Customer facing" | "Internal" | "Work note" = "Customer facing";
+
+      if (legendMatch) {
+        commentBy = legendMatch[1].trim();
+        date = legendMatch[2].trim();
+        commentContext =
+          legendMatch[4] === "IO" ? "Internal" :
+          legendMatch[4] === "WN" ? "Work note" : "Customer facing";
+      }
+
+      const div = fs.querySelector(".cssform") as HTMLElement | null;
+      let body = div ? div.innerHTML : "";
+      body = body
+        .replace(/<p>/gi, "")
+        .replace(/<\/p>/gi, "\n")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/&nbsp;/g, " ")
+        .replace(/<[^>]+>/g, "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+
+      return { date, commentBy, context: commentContext, content: body };
+    });
+  });
+
+  // Extract linked ticket IDs, then recurse into unvisited ones
+  const linkedIds = await extractLinkedTicketIds(ticketFrame, page);
+  console.error(`[get_ticket_context] ${ticketId} → linked: [${linkedIds.join(", ") || "none"}]`);
+
+  const linkedTickets: TicketContext[] = [];
+  for (const linkedId of linkedIds) {
+    if (!visited.has(linkedId.toUpperCase())) {
+      const linked = await extractSingleTicketContext(page, linkedId, baseUrl, visited);
+      linkedTickets.push(linked);
+    } else {
+      console.error(`[get_ticket_context] ${ticketId} → skipping ${linkedId} (already visited)`);
+    }
+  }
+
+  return { ticketId, url: ticketUrl, general, comments, linkedTickets };
+}
+
+export async function getTicketContextViaUi(
+  ticketId: string,
+  options: AutomationOptions = {},
+): Promise<TicketContext> {
+  const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+  const { context, page } = await launchEdge(options);
+
+  try {
+    await waitForLogin(page, baseUrl);
+    const visited = new Set<string>();
+    return await extractSingleTicketContext(page, ticketId, baseUrl, visited);
+  } finally {
+    if (!options.keepOpen) {
+      await context.close();
+    }
+  }
 }
 
 export async function addTimeEntriesViaUi(

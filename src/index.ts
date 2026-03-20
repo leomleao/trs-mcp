@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { addTimeEntriesViaUi } from "./trs-ui-automation.js";
+import { addTimeEntriesViaUi, getTicketContextViaUi } from "./trs-ui-automation.js";
 import { autoLearnAlias, resolveBookingSelection } from "./trs-ticket-mappings.js";
 
 const TRS_BASE_URL = process.env.TRS_BASE_URL ?? "https://portal.theconfigteam.co.uk/api";
@@ -387,6 +387,45 @@ server.registerTool(
         error: error instanceof Error ? error.message : String(error),
       });
       return formatToolError(error instanceof Error ? error.message : "Failed to book TRS time from activity.");
+    }
+  },
+);
+
+server.registerTool(
+  "get_ticket_context",
+  {
+    title: "Get Ticket Context",
+    description:
+      "Retrieve general information and all comments from a TRS ticket by navigating to the ticket page. Returns structured data including title, details, priority, client info, and the full comment history.",
+    inputSchema: {
+      ticket_id: z.string().min(1).describe("The ticket ID, e.g. TCTEVI-7343"),
+    },
+  },
+  async ({ ticket_id }) => {
+    try {
+      const ticketContext = await getTicketContextViaUi(ticket_id.trim(), {
+        baseUrl: TRS_BASE_URL.replace(/\/api\/?$/, ""),
+        keepOpen: false,
+      });
+
+      const commentCount = ticketContext.comments.length;
+      const summary = `Retrieved context for ticket ${ticket_id}: "${ticketContext.general.title}". ${commentCount} comment(s) found.`;
+
+      return formatToolResult(
+        {
+          ticket_id: ticketContext.ticketId,
+          url: ticketContext.url,
+          general: ticketContext.general,
+          comments: ticketContext.comments,
+        },
+        summary,
+      );
+    } catch (error) {
+      console.error("Failed to get ticket context", {
+        ticketId: ticket_id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return formatToolError(error instanceof Error ? error.message : "Failed to get ticket context.");
     }
   },
 );
