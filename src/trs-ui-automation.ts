@@ -203,10 +203,6 @@ async function handleLoginIfNeeded(page: Page, baseUrl: string): Promise<void> {
   await readLine("");
 }
 
-async function waitForLogin(page: Page, baseUrl: string): Promise<void> {
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-  await handleLoginIfNeeded(page, baseUrl);
-}
 
 function formatHourValue(hours: number): string {
   return hours.toString();
@@ -265,7 +261,11 @@ async function findTimeRecordingRoot(page: Page): Promise<InteractionRoot> {
 
 async function ensureOnEditTimePage(page: Page, baseUrl: string): Promise<void> {
   const editTimeUrl = `${baseUrl}/time_recording/edit/`;
-  await page.goto(editTimeUrl, { waitUntil: "networkidle" });
+  await page.goto(editTimeUrl, { waitUntil: "domcontentloaded" });
+  await handleLoginIfNeeded(page, baseUrl);
+  if (!page.url().startsWith(editTimeUrl)) {
+    await page.goto(editTimeUrl, { waitUntil: "domcontentloaded" });
+  }
 
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
@@ -1541,7 +1541,12 @@ export async function getMyWorklistViaUi(options: AutomationOptions = {}): Promi
   const { context, page } = await launchEdge(options);
 
   try {
-    await waitForLogin(page, baseUrl);
+    const overviewUrl = `${baseUrl}/helpdesk/overview/`;
+    await page.goto(overviewUrl, { waitUntil: "domcontentloaded" });
+    await handleLoginIfNeeded(page, baseUrl);
+    if (!page.url().startsWith(overviewUrl)) {
+      await page.goto(overviewUrl, { waitUntil: "domcontentloaded" });
+    }
 
     const root = await findWorklistRoot(page);
 
@@ -1645,7 +1650,6 @@ export async function addTimeEntriesViaUi(
 
   const { context, page } = await launchEdge(options);
   try {
-    await waitForLogin(page, baseUrl);
     await ensureOnEditTimePage(page, baseUrl);
 
     const results: Array<{ entry: TimeEntry; success: boolean; error?: string; warning?: string; screenshotPath?: string }> =
