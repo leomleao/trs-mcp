@@ -178,9 +178,7 @@ async function attemptAzureAutoLogin(page: Page, baseUrl: string): Promise<boole
   return isAuthenticatedPortalPage(page, baseUrl);
 }
 
-async function waitForLogin(page: Page, baseUrl: string): Promise<void> {
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-
+async function handleLoginIfNeeded(page: Page, baseUrl: string): Promise<void> {
   const isLoginPage = await page.locator("input[type=password]").first().count().then((c) => c > 0);
   if (!isLoginPage) {
     return;
@@ -203,6 +201,11 @@ async function waitForLogin(page: Page, baseUrl: string): Promise<void> {
   }
   console.log("After login completes and you are on the main dashboard, press ENTER to continue.");
   await readLine("");
+}
+
+async function waitForLogin(page: Page, baseUrl: string): Promise<void> {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await handleLoginIfNeeded(page, baseUrl);
 }
 
 function formatHourValue(hours: number): string {
@@ -1228,6 +1231,8 @@ export interface TicketGeneralInfo {
   reportedBy: string;
   clientContact: string;
   priority: string;
+  nextContactDate: string;
+  totalTicketTime: string;
 }
 
 export interface TicketComment {
@@ -1237,11 +1242,30 @@ export interface TicketComment {
   content: string;
 }
 
+export interface TicketTimeEntry {
+  date: string;
+  user: string;
+  durationCON: number;
+  durationCUS: number;
+  approved: boolean;
+}
+
+export interface TicketTimeSummary {
+  totalCON: number | "";
+  totalCUS: number | "";
+  approvedCON: number | "";
+  approvedCUS: number | "";
+  unapprovedCON: number | "";
+  unapprovedCUS: number | "";
+  entries: TicketTimeEntry[];
+}
+
 export interface TicketContext {
   ticketId: string;
   url: string;
   general: TicketGeneralInfo;
   comments: TicketComment[];
+  time: TicketTimeSummary;
   linkedTickets: TicketContext[];
 }
 
@@ -1304,14 +1328,9 @@ async function extractSingleTicketContext(
 
   const ticketUrl = `${baseUrl}/hd/${ticketId}`;
   await page.goto(ticketUrl, { waitUntil: "domcontentloaded" });
-
-  if (page.url().includes("action=login")) {
-    console.log(`Please log in to the TRS portal, then navigate to: ${ticketUrl}`);
-    console.log("Press ENTER once you are on the ticket page.");
-    await readLine("");
-    if (!page.url().startsWith(ticketUrl)) {
-      await page.goto(ticketUrl, { waitUntil: "domcontentloaded" });
-    }
+  await handleLoginIfNeeded(page, baseUrl);
+  if (!page.url().startsWith(ticketUrl)) {
+    await page.goto(ticketUrl, { waitUntil: "domcontentloaded" });
   }
 
   const ticketFrame = await findTicketFrame(page);
@@ -1361,6 +1380,8 @@ async function extractSingleTicketContext(
       reportedBy: getInputValue("txt_ed_reported_by"),
       clientContact: getSelectText("ddl_ed_client_contact"),
       priority: getSelectText("ddl_ed_priority"),
+      nextContactDate: getInputValue("txt_next_contact_date"),
+      totalTicketTime: getInputValue("txt_ed_quote"),
     };
   });
 
@@ -1408,6 +1429,46 @@ async function extractSingleTicketContext(
     });
   });
 
+  const timeTab = ticketFrame.locator("[role='tab']").filter({ hasText: /^Time$/i }).first();
+  if ((await timeTab.count()) > 0) {
+    await timeTab.click();
+  }
+  await ticketFrame.locator("#udp_Time").waitFor({ timeout: 10_000 }).catch(() => undefined);
+
+  const time = await ticketFrame.evaluate((): TicketTimeSummary => {
+    function spanNum(id: string): number | "" {
+      const el = document.querySelector(`#${id}`) as HTMLElement | null;
+      return Number(el?.innerText?.trim()) || "";
+    }
+
+    const entries: TicketTimeEntry[] = [];
+    const tbody = document.querySelector("#gv_Time tbody");
+    if (tbody) {
+      for (const row of tbody.querySelectorAll("tr")) {
+        const cells = row.querySelectorAll("td");
+        if (cells.length < 4) continue;
+        entries.push({
+          date: (cells[0] as HTMLElement).innerText.trim(),
+          user: (cells[1] as HTMLElement).innerText.trim(),
+          durationCON: Number((cells[2] as HTMLElement).innerText.trim()) || 0,
+          durationCUS: Number((cells[3] as HTMLElement).innerText.trim()) || 0,
+          approved: (cells[4] as HTMLElement)?.innerText?.trim() !== "\u00a0" &&
+                    (cells[4] as HTMLElement)?.innerText?.trim() !== "",
+        });
+      }
+    }
+
+    return {
+      totalCON: spanNum("lbl_total_time_CON"),
+      totalCUS: spanNum("lbl_total_time_CUS"),
+      approvedCON: spanNum("lbl_total_time_a_CON"),
+      approvedCUS: spanNum("lbl_total_time_a_CUS"),
+      unapprovedCON: spanNum("lbl_total_time_u_CON"),
+      unapprovedCUS: spanNum("lbl_total_time_u_CUS"),
+      entries,
+    };
+  });
+
   // Extract linked ticket IDs, then recurse into unvisited ones
   const linkedIds = await extractLinkedTicketIds(ticketFrame);
   console.error(`[get_ticket_context] ${ticketId} → linked: [${linkedIds.join(", ") || "none"}]`);
@@ -1422,7 +1483,7 @@ async function extractSingleTicketContext(
     }
   }
 
-  return { ticketId, url: ticketUrl, general, comments, linkedTickets };
+  return { ticketId, url: ticketUrl, general, comments, time, linkedTickets };
 }
 
 export async function getTicketContextViaUi(
@@ -1433,7 +1494,6 @@ export async function getTicketContextViaUi(
   const { context, page } = await launchEdge(options);
 
   try {
-    await waitForLogin(page, baseUrl);
     const visited = new Set<string>();
     return await extractSingleTicketContext(page, ticketId, baseUrl, visited);
   } finally {
