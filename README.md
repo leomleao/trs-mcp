@@ -24,6 +24,7 @@ Retrieve the full context for a TRS ticket by ID (e.g. `TCTEVI-7343`). Returns:
 - **General info** — title, details, priority, client location, service type, external ID, client project, reported by, client contact, logged by, next contact date, total ticket time
 - **Comments** — full comment history with author, date, and context type (Customer facing / Work note / Internal)
 - **Time** — totals (CON/CUS), approved and unapproved breakdowns, and individual time entries (date, user, duration CON, duration CUS, approved flag)
+- **Web/document links** — SharePoint (and other) documents attached to the ticket under the Web Links section (`#gv_Links_Web`), each with a `text` label and a clean `url` (Office URI prefixes such as `ms-word:ofe|u|` are stripped)
 - **Linked tickets** — recursively extracts the same data for all tickets linked under the HD Links tab, tracking already-visited tickets to handle bidirectional links without infinite loops
 
 ## Environment variables
@@ -44,6 +45,7 @@ Retrieve the full context for a TRS ticket by ID (e.g. `TCTEVI-7343`). Returns:
 - `get_my_worklist` navigates to the portal home, selects **My Worklist** from the `#cphB_ddlReports` dropdown, clicks **Run Report**, waits for the results table (`#cphB_gv_My_Worklist`), then extracts all rows via `page.evaluate`.
 - `get_ticket_context` uses Playwright to navigate the portal. Ticket content is rendered inside an iframe — the implementation searches all page frames for `#tabGeneral` rather than assuming a fixed frame URL.
 - Linked ticket IDs are read from the first column of the HD Links table (`#udp_Links_HD`), where the portal stores the canonical text ID (e.g. `TCTLAOR-138`).
+- Web/document links are extracted from `#gv_Links_Web` on the same Links tab in a single `page.evaluate` call alongside the linked ticket scan. Office URI prefixes (`ms-word:ofe|u|`, etc.) are stripped so the returned URL is a plain HTTPS SharePoint link.
 
 ## Possible future features
 

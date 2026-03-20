@@ -1260,12 +1260,18 @@ export interface TicketTimeSummary {
   entries: TicketTimeEntry[];
 }
 
+export interface TicketWebLink {
+  text: string;
+  url: string;
+}
+
 export interface TicketContext {
   ticketId: string;
   url: string;
   general: TicketGeneralInfo;
   comments: TicketComment[];
   time: TicketTimeSummary;
+  webLinks: TicketWebLink[];
   linkedTickets: TicketContext[];
 }
 
@@ -1281,7 +1287,7 @@ async function findTicketFrame(page: Page): Promise<Frame | null> {
   return null;
 }
 
-async function extractLinkedTicketIds(ticketFrame: Frame): Promise<string[]> {
+async function extractLinksTabData(ticketFrame: Frame): Promise<{ linkedIds: string[]; webLinks: TicketWebLink[] }> {
   // Tab label includes the count, e.g. "Links (4)" — match loosely
   const linksTab = ticketFrame.locator("[role='tab']").filter({ hasText: /Links/i }).first();
   if ((await linksTab.count()) > 0) {
@@ -1289,7 +1295,7 @@ async function extractLinkedTicketIds(ticketFrame: Frame): Promise<string[]> {
     await ticketFrame.locator("#udp_Links_HD").waitFor({ timeout: 10_000 }).catch(() => undefined);
   }
 
-  return ticketFrame.evaluate((): string[] => {
+  return ticketFrame.evaluate((): { linkedIds: string[]; webLinks: TicketWebLink[] } => {
     const seen = new Set<string>();
     const TICKET_RE = /^[A-Z]+-\d+$/;
 
@@ -1313,7 +1319,24 @@ async function extractLinkedTicketIds(ticketFrame: Frame): Promise<string[]> {
       }
     }
 
-    return [...seen];
+    // Web/document links from #gv_Links_Web — href is "ms-word:ofe|u|<actual_url>"
+    const webLinks: TicketWebLink[] = [];
+    const webLinksTable = document.querySelector("#gv_Links_Web");
+    if (webLinksTable) {
+      for (const row of webLinksTable.querySelectorAll("tbody tr")) {
+        const cells = row.querySelectorAll("td");
+        if (cells.length < 2) continue;
+        const linkText = (cells[0] as HTMLElement).innerText.trim();
+        const viewAnchor = cells[1]?.querySelector("a[href]") as HTMLAnchorElement | null;
+        if (!viewAnchor) continue;
+        const rawHref = viewAnchor.getAttribute("href") ?? "";
+        // Strip "ms-word:ofe|u|" or similar Office URI prefixes
+        const url = rawHref.replace(/^ms-\w+:[^|]*\|u\|/, "");
+        if (linkText && url) webLinks.push({ text: linkText, url });
+      }
+    }
+
+    return { linkedIds: [...seen], webLinks };
   });
 }
 
@@ -1469,9 +1492,9 @@ async function extractSingleTicketContext(
     };
   });
 
-  // Extract linked ticket IDs, then recurse into unvisited ones
-  const linkedIds = await extractLinkedTicketIds(ticketFrame);
-  console.error(`[get_ticket_context] ${ticketId} → linked: [${linkedIds.join(", ") || "none"}]`);
+  // Extract linked ticket IDs and web/document links from the Links tab
+  const { linkedIds, webLinks } = await extractLinksTabData(ticketFrame);
+  console.error(`[get_ticket_context] ${ticketId} → linked: [${linkedIds.join(", ") || "none"}], webLinks: ${webLinks.length}`);
 
   const linkedTickets: TicketContext[] = [];
   for (const linkedId of linkedIds) {
@@ -1483,7 +1506,7 @@ async function extractSingleTicketContext(
     }
   }
 
-  return { ticketId, url: ticketUrl, general, comments, time, linkedTickets };
+  return { ticketId, url: ticketUrl, general, comments, time, webLinks, linkedTickets };
 }
 
 export interface WorklistItem {

@@ -396,7 +396,7 @@ server.registerTool(
   {
     title: "Get Ticket Context",
     description:
-      "Retrieve general information and all comments from a TRS ticket by navigating to the ticket page. Returns structured data including title, details, priority, client info, and the full comment history.",
+      "Retrieve general information, comments, time entries, web/document links, and linked tickets from a TRS ticket by navigating to the ticket page. Returns structured data including title, details, priority, client info, full comment history, and any SharePoint document links attached to the ticket.",
     inputSchema: {
       ticket_id: z.string().min(1).describe("The ticket ID, e.g. TCTEVI-7343"),
     },
@@ -413,6 +413,8 @@ server.registerTool(
         url: ticketContext.url,
         general: ticketContext.general,
         comments: ticketContext.comments,
+        time: ticketContext.time,
+        web_links: ticketContext.webLinks,
         linked_tickets: ticketContext.linkedTickets,
       };
 
