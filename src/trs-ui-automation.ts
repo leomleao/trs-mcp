@@ -841,6 +841,25 @@ async function waitForModalToClose(modal: Locator, page: Page): Promise<boolean>
   return false;
 }
 
+async function countEntryRows(page: Page, entry: TimeEntry): Promise<number> {
+  // Count how many times the ticket ID or description appear in the full page text across all frames.
+  // Used to detect whether a new row was actually added (before vs after comparison).
+  const patterns = [entry.ticketId, entry.description]
+    .map((p) => p.trim().toLowerCase())
+    .filter(Boolean);
+  let maxCount = 0;
+  for (const root of getInteractionRoots(page)) {
+    const text = (await root.locator("body").innerText().catch(() => "")).toLowerCase();
+    for (const pattern of patterns) {
+      let count = 0;
+      let pos = 0;
+      while ((pos = text.indexOf(pattern, pos)) !== -1) { count++; pos += pattern.length; }
+      if (count > maxCount) maxCount = count;
+    }
+  }
+  return maxCount;
+}
+
 async function detectEntryRow(dayContainer: Locator, entry: TimeEntry): Promise<boolean> {
   const patterns = [entry.ticketId, entry.description];
 
@@ -1002,6 +1021,9 @@ async function addEntryToPage(page: Page, entry: TimeEntry, debug: boolean, retr
     const commentResult = await fillTinyMceComment(page, modal, entry.description);
     const commentWarning = commentResult.warning;
 
+    // Snapshot row count before submitting so we can detect duplicates
+    const rowCountBefore = await countEntryRows(page, entry).catch(() => 0);
+
     const submitResult = await submitAddTimeModal(page, modal);
     if (!submitResult.success) {
       const screenshotPath = await captureDebugScreenshot(page, "submit-failed", debug);
@@ -1023,15 +1045,17 @@ async function addEntryToPage(page: Page, entry: TimeEntry, debug: boolean, retr
     }
 
     await page.waitForTimeout(1500);
-    const rowDetectedInDay = await detectEntryRow(container, entry).catch(() => false);
-    const rowDetectedAnywhere = rowDetectedInDay ? true : await detectEntryRowAnywhere(page, entry);
+    const rowCountAfter = await countEntryRows(page, entry).catch(() => rowCountBefore);
+    const newRowAdded = rowCountAfter > rowCountBefore;
     const pageMessages = await extractPageMessages(root).catch(() => undefined);
     const screenshotPath = await captureDebugScreenshot(page, "post-submit", debug);
 
-    const rowWarning = !rowDetectedAnywhere
+    const rowWarning = !newRowAdded
       ? formatUiError(
           "entry_row_not_detected",
-          pageMessages
+          rowCountBefore > 0
+            ? `No new row detected — an entry for '${entry.ticketId || entry.description}' already existed (${rowCountBefore} match(es) before submit). Possible duplicate rejected by portal.`
+            : pageMessages
             ? `No new row for '${entry.ticketId || entry.description}' detected. Page messages: ${pageMessages}`
             : `No new row for '${entry.ticketId || entry.description}' detected. Modal closed — verify in TRS that the entry was saved.`,
         )
@@ -1056,6 +1080,179 @@ async function addEntryToPage(page: Page, entry: TimeEntry, debug: boolean, retr
   }
 }
 
+function formatDateForPicker(isoDate: string): string {
+  // Produces "Wednesday, 18 March 2026" to match the portal's datepicker format
+  const date = new Date(`${isoDate}T12:00:00`);
+  const weekday = date.toLocaleDateString("en-GB", { weekday: "long" });
+  const day = date.getDate();
+  const month = date.toLocaleDateString("en-GB", { month: "long" });
+  const year = date.getFullYear();
+  return `${weekday}, ${day} ${month} ${year}`;
+}
+
+async function fillDatePicker(page: Page, isoDate: string): Promise<void> {
+  const formatted = formatDateForPicker(isoDate);
+  const dateInput = await findFirstVisibleLocator(page, [
+    "#txt_tr_date",
+    "input[name='txt_tr_date']",
+    "input[id*='txt_tr_date']",
+  ]);
+  if (!dateInput) return;
+
+  await dateInput.evaluate((el, value) => {
+    const input = el as HTMLInputElement;
+    const jq = (window as any).jQuery || (window as any).$;
+    if (jq) {
+      try { jq(input).datepicker("setDate", value); } catch { /* ignore */ }
+    }
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.dispatchEvent(new Event("blur", { bubbles: true }));
+  }, formatted);
+
+  await page.waitForTimeout(300);
+}
+
+async function submitAndKeepOpen(page: Page, modal: Locator): Promise<UiActionResult> {
+  const addAnotherButton =
+    (await findFirstVisibleLocator(page, [
+      "#openTime_AddAn",
+      "button#openTime_AddAn",
+      "button[id='openTime_AddAn']",
+    ])) ?? modal.locator("#openTime_AddAn, button:has-text('Add Time + Another')").first();
+
+  if ((await addAnotherButton.count()) === 0) {
+    return {
+      success: false,
+      error: formatUiError("submit_failed", `'Add Time + Another' button not found. Page URL: ${page.url()}`),
+    };
+  }
+
+  await addAnotherButton.scrollIntoViewIfNeeded().catch(() => undefined);
+  await addAnotherButton.click().catch(async () => {
+    await addAnotherButton.click({ force: true }).catch(() => undefined);
+  });
+
+  // Wait for the modal to reset (duration input clears)
+  await page.waitForTimeout(800);
+  return { success: true };
+}
+
+type BatchEntryResult = { entry: TimeEntry; success: boolean; error?: string; warning?: string; screenshotPath?: string };
+
+async function addEntriesBatch(page: Page, entries: TimeEntry[], debug: boolean, retries: number): Promise<BatchEntryResult[]> {
+  const results: BatchEntryResult[] = [];
+
+  // Open the modal from any available "Add Time" button
+  const root = await findTimeRecordingRoot(page);
+  const modal = await withRetry(
+    retries,
+    () => openAddTimeModal(root.locator("body").first(), root, page),
+    (result) => result === null,
+  );
+
+  if (!modal) {
+    const screenshotPath = await captureDebugScreenshot(page, "batch-modal-open-failed", debug);
+    const error = formatUiError("add_time_modal_not_found", `Could not open Add Time modal for batch. Page URL: ${page.url()}`);
+    return entries.map((entry) => ({ entry, success: false, error, screenshotPath }));
+  }
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const isLast = i === entries.length - 1;
+
+    // Set date via picker
+    await fillDatePicker(page, entry.date);
+
+    // Select ticket with retry
+    const ticketResult = await withRetry(
+      retries,
+      () => selectTicket(modal, page, entry.ticketId, entry.description, entry.bookingMode),
+      (r) => !r.success,
+    );
+    if (!ticketResult.success) {
+      const screenshotPath = await captureDebugScreenshot(page, `batch-ticket-failed-${i}`, debug);
+      results.push({ entry, success: false, error: ticketResult.error, screenshotPath });
+      break;
+    }
+
+    // Fill duration
+    const duration = await findDurationInput(page, modal);
+    if (!duration || (await duration.count()) === 0) {
+      const screenshotPath = await captureDebugScreenshot(page, `batch-duration-not-found-${i}`, debug);
+      results.push({
+        entry, success: false, screenshotPath,
+        error: formatUiError("submit_failed", `Duration input not found for entry ${i + 1}. Page URL: ${page.url()}`),
+      });
+      break;
+    }
+    await duration.fill(formatHourValue(entry.hours));
+
+    // Fill comment (warning only, never abort)
+    const commentResult = await fillTinyMceComment(page, modal, entry.description);
+
+    // Snapshot row count before submitting so we can detect duplicates
+    const rowCountBefore = await countEntryRows(page, entry).catch(() => 0);
+
+    if (isLast) {
+      // Last entry: regular submit + wait for modal close
+      const submitResult = await submitAddTimeModal(page, modal);
+      if (!submitResult.success) {
+        const screenshotPath = await captureDebugScreenshot(page, `batch-submit-failed-${i}`, debug);
+        results.push({ entry, success: false, error: submitResult.error, screenshotPath });
+        break;
+      }
+      const modalClosed = await waitForModalToClose(modal, page);
+      if (!modalClosed) {
+        const validationText = await extractVisibleValidationText(modal);
+        const screenshotPath = await captureDebugScreenshot(page, `batch-modal-not-closed-${i}`, debug);
+        results.push({
+          entry, success: false, screenshotPath,
+          error: formatUiError("submit_failed", (validationText ?? "Modal did not close.") + ` | Page URL: ${page.url()}`),
+        });
+        break;
+      }
+      await page.waitForTimeout(1000);
+      const rowCountAfter = await countEntryRows(page, entry).catch(() => rowCountBefore);
+      const newRowAdded = rowCountAfter > rowCountBefore;
+      const screenshotPath = await captureDebugScreenshot(page, `batch-success-${i}`, debug);
+      const dupWarning = !newRowAdded
+        ? formatUiError("entry_row_not_detected", rowCountBefore > 0
+            ? `No new row detected — entry for '${entry.ticketId || entry.description}' already existed (${rowCountBefore} match(es) before submit). Possible duplicate rejected by portal.`
+            : `No new row detected. Modal closed — verify in TRS.`)
+        : undefined;
+      const warnings = [commentResult.warning, dupWarning].filter(Boolean).join(" | ");
+      results.push({ entry, success: true, warning: warnings || undefined, screenshotPath });
+    } else {
+      // Non-last entries: click "Add Time + Another" to keep modal open
+      const addAnotherResult = await submitAndKeepOpen(page, modal);
+      if (!addAnotherResult.success) {
+        const screenshotPath = await captureDebugScreenshot(page, `batch-add-another-failed-${i}`, debug);
+        results.push({ entry, success: false, error: addAnotherResult.error, screenshotPath });
+        break;
+      }
+      await page.waitForTimeout(500);
+      const rowCountAfter = await countEntryRows(page, entry).catch(() => rowCountBefore);
+      const newRowAdded = rowCountAfter > rowCountBefore;
+      const dupWarning = !newRowAdded
+        ? formatUiError("entry_row_not_detected", rowCountBefore > 0
+            ? `No new row detected — entry for '${entry.ticketId || entry.description}' already existed (${rowCountBefore} match(es) before submit). Possible duplicate rejected by portal.`
+            : `No new row detected after 'Add Time + Another'. Verify in TRS.`)
+        : undefined;
+      const warnings = [commentResult.warning, dupWarning].filter(Boolean).join(" | ");
+      results.push({ entry, success: true, warning: warnings || undefined });
+    }
+  }
+
+  // Mark any remaining entries as not attempted if we broke early
+  for (let i = results.length; i < entries.length; i++) {
+    results.push({ entry: entries[i], success: false, error: "Not attempted: an earlier entry in the batch failed." });
+  }
+
+  return results;
+}
+
 export async function addTimeEntriesViaUi(
   entries: TimeEntry[],
   options: AutomationOptions = {},
@@ -1069,11 +1266,10 @@ export async function addTimeEntriesViaUi(
     await waitForLogin(page, baseUrl);
     await ensureOnEditTimePage(page, baseUrl);
 
-    const results: Array<{ entry: TimeEntry; success: boolean; error?: string; warning?: string; screenshotPath?: string }> = [];
-    for (const entry of entries) {
-      const result = await addEntryToPage(page, entry, debug, retries);
-      results.push({ entry, ...result });
-    }
+    const results: Array<{ entry: TimeEntry; success: boolean; error?: string; warning?: string; screenshotPath?: string }> =
+      entries.length > 1
+        ? await addEntriesBatch(page, entries, debug, retries)
+        : [{ entry: entries[0], ...(await addEntryToPage(page, entries[0], debug, retries)) }];
 
     return { success: results.every((r) => r.success), results };
   } finally {
