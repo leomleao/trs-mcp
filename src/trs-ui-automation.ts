@@ -24,6 +24,36 @@ export interface AutomationOptions {
 
 const DEFAULT_BASE_URL = "https://portal.theconfigteam.co.uk";
 
+// Singleton browser — kept open across tool calls to avoid repeated Edge launch (~8-12s)
+let _sharedContext: BrowserContext | null = null;
+let _sharedPage: Page | null = null;
+
+async function getSharedBrowser(options: AutomationOptions): Promise<{ context: BrowserContext; page: Page }> {
+  if (_sharedContext && _sharedPage && !_sharedPage.isClosed()) {
+    try {
+      await _sharedPage.title(); // cheap liveness check
+      return { context: _sharedContext, page: _sharedPage };
+    } catch {
+      _sharedContext = null;
+      _sharedPage = null;
+    }
+  }
+  const result = await launchEdge(options);
+  _sharedContext = result.context;
+  _sharedPage = result.page;
+  return result;
+}
+
+async function closeSharedBrowser(): Promise<void> {
+  const context = _sharedContext;
+  _sharedContext = null;
+  _sharedPage = null;
+
+  if (context) {
+    await context.close().catch(() => undefined);
+  }
+}
+
 type UiStepError =
   | "day_tab_not_found"
   | "add_time_modal_not_found"
@@ -1276,13 +1306,13 @@ export interface TicketContext {
 }
 
 async function findTicketFrame(page: Page): Promise<Frame | null> {
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    for (const frame of page.frames()) {
-      const count = await frame.locator("#tabGeneral").count().catch(() => 0);
-      if (count > 0) return frame;
-    }
-    await page.waitForTimeout(100);
+  try {
+    await page.frameLocator("iframe").locator("#tabGeneral").first().waitFor({ timeout: 30_000 });
+  } catch {
+    return null;
+  }
+  for (const frame of page.frames()) {
+    if ((await frame.locator("#tabGeneral").count().catch(() => 0)) > 0) return frame;
   }
   return null;
 }
@@ -1361,6 +1391,9 @@ async function extractSingleTicketContext(
     throw new Error(`Could not find ticket content frame for ${ticketId}. Page URL: ${page.url()}`);
   }
 
+  // Once the main ticket details table is present, the rest of the ticket context is already in the DOM.
+  await ticketFrame.locator("#tblHDID").waitFor({ timeout: 15_000 });
+
   const general = await ticketFrame.evaluate((): TicketGeneralInfo => {
     function getSelectText(id: string): string {
       const el = document.querySelector(`#${id}`) as HTMLSelectElement | null;
@@ -1412,7 +1445,6 @@ async function extractSingleTicketContext(
   if ((await commentsTab.count()) > 0) {
     await commentsTab.click();
   }
-  await ticketFrame.locator("#udp_Comments").waitFor({ timeout: 15_000 }).catch(() => undefined);
 
   const comments = await ticketFrame.evaluate((): TicketComment[] => {
     const container = document.querySelector("#udp_Comments");
@@ -1456,7 +1488,6 @@ async function extractSingleTicketContext(
   if ((await timeTab.count()) > 0) {
     await timeTab.click();
   }
-  await ticketFrame.locator("#udp_Time").waitFor({ timeout: 10_000 }).catch(() => undefined);
 
   const time = await ticketFrame.evaluate((): TicketTimeSummary => {
     function spanNum(id: string): number | "" {
@@ -1538,87 +1569,87 @@ async function findWorklistRoot(page: Page): Promise<InteractionRoot> {
 
 export async function getMyWorklistViaUi(options: AutomationOptions = {}): Promise<WorklistItem[]> {
   const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
-  const { context, page } = await launchEdge(options);
+  const { page } = await getSharedBrowser(options);
 
   try {
     const overviewUrl = `${baseUrl}/helpdesk/overview/`;
     await page.goto(overviewUrl, { waitUntil: "domcontentloaded" });
-    await handleLoginIfNeeded(page, baseUrl);
-    if (!page.url().startsWith(overviewUrl)) {
-      await page.goto(overviewUrl, { waitUntil: "domcontentloaded" });
-    }
-
-    const root = await findWorklistRoot(page);
-
-    // Select "My Worklist" report
-    const reportSelect = root.locator("#cphB_ddlReports").first();
-    await reportSelect.selectOption("My Worklist");
-    await page.waitForTimeout(300);
-
-    // Click Run Report
-    const runButton = root.locator("#cphB_butRunReport").first();
-    await runButton.click();
-
-    // Wait for the results table to appear
-    await page.waitForSelector("#cphB_gv_My_Worklist tbody tr", { timeout: 30_000 }).catch(() => undefined);
-    await page.waitForLoadState("networkidle").catch(() => undefined);
-
-    // Extract table data
-    const items = await page.evaluate((): WorklistItem[] => {
-      const table = document.querySelector("#cphB_gv_My_Worklist");
-      if (!table) return [];
-
-      const rows = table.querySelectorAll("tbody tr");
-      const results: WorklistItem[] = [];
-
-      for (const row of rows) {
-        const cells = row.querySelectorAll("td");
-        if (cells.length < 14) continue;
-
-        function cellText(index: number): string {
-          const cell = cells[index] as HTMLElement | undefined;
-          if (!cell) return "";
-          return (cell.innerText ?? "").replace(/\u00a0/g, "").trim();
-        }
-
-        // Priority is in a span inside the first cell
-        const prioritySpan = cells[0]?.querySelector("span[class*='priority_']") as HTMLElement | null;
-        const priority = prioritySpan ? (prioritySpan.innerText ?? "").trim() : cellText(0);
-
-        // Ticket ID is in the anchor link inside the hd_id cell
-        const ticketLink = cells[3]?.querySelector("a.dropdown_link") as HTMLElement | null;
-        const ticketId = ticketLink ? (ticketLink.innerText ?? "").trim() : cellText(3);
-
-        // Last comment date is in an anchor
-        const commentLink = cells[10]?.querySelector("a.comment") as HTMLElement | null;
-        const lastComment = commentLink ? (commentLink.innerText ?? "").replace(/\s+/g, " ").trim() : cellText(10);
-
-        results.push({
-          priority,
-          client: cellText(1),
-          nextSlaDate: cellText(2),
-          ticketId,
-          externalId: cellText(4),
-          title: cellText(5),
-          type: cellText(6),
-          nextContactDate: cellText(7),
-          status: cellText(8),
-          deliveryDate: cellText(9),
-          lastComment,
-          owner: cellText(11),
-          assignedTo: cellText(12),
-          project: cellText(13),
-          module: cellText(14),
-        });
+      await handleLoginIfNeeded(page, baseUrl);
+      if (!page.url().startsWith(overviewUrl)) {
+        await page.goto(overviewUrl, { waitUntil: "domcontentloaded" });
       }
 
-      return results;
-    });
+      const root = await findWorklistRoot(page);
 
-    return items;
+      // Select "My Worklist" report
+      const reportSelect = root.locator("#cphB_ddlReports").first();
+      await reportSelect.selectOption("My Worklist");
+      await page.waitForTimeout(300);
+
+      // Click Run Report
+      const runButton = root.locator("#cphB_butRunReport").first();
+      await runButton.click();
+
+      // Wait for the results table to appear
+      await page.waitForSelector("#cphB_gv_My_Worklist tbody tr", { timeout: 30_000 }).catch(() => undefined);
+      await page.waitForLoadState("networkidle").catch(() => undefined);
+
+      // Extract table data
+      const items = await page.evaluate((): WorklistItem[] => {
+        const table = document.querySelector("#cphB_gv_My_Worklist");
+        if (!table) return [];
+
+        const rows = table.querySelectorAll("tbody tr");
+        const results: WorklistItem[] = [];
+
+        for (const row of rows) {
+          const cells = row.querySelectorAll("td");
+          if (cells.length < 14) continue;
+
+          function cellText(index: number): string {
+            const cell = cells[index] as HTMLElement | undefined;
+            if (!cell) return "";
+            return (cell.innerText ?? "").replace(/\u00a0/g, "").trim();
+          }
+
+          // Priority is in a span inside the first cell
+          const prioritySpan = cells[0]?.querySelector("span[class*='priority_']") as HTMLElement | null;
+          const priority = prioritySpan ? (prioritySpan.innerText ?? "").trim() : cellText(0);
+
+          // Ticket ID is in the anchor link inside the hd_id cell
+          const ticketLink = cells[3]?.querySelector("a.dropdown_link") as HTMLElement | null;
+          const ticketId = ticketLink ? (ticketLink.innerText ?? "").trim() : cellText(3);
+
+          // Last comment date is in an anchor
+          const commentLink = cells[10]?.querySelector("a.comment") as HTMLElement | null;
+          const lastComment = commentLink ? (commentLink.innerText ?? "").replace(/\s+/g, " ").trim() : cellText(10);
+
+          results.push({
+            priority,
+            client: cellText(1),
+            nextSlaDate: cellText(2),
+            ticketId,
+            externalId: cellText(4),
+            title: cellText(5),
+            type: cellText(6),
+            nextContactDate: cellText(7),
+            status: cellText(8),
+            deliveryDate: cellText(9),
+            lastComment,
+            owner: cellText(11),
+            assignedTo: cellText(12),
+            project: cellText(13),
+            module: cellText(14),
+          });
+        }
+
+        return results;
+      });
+
+      return items;
   } finally {
     if (!options.keepOpen) {
-      await context.close();
+      await closeSharedBrowser();
     }
   }
 }
@@ -1628,14 +1659,14 @@ export async function getTicketContextViaUi(
   options: AutomationOptions = {},
 ): Promise<TicketContext> {
   const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
-  const { context, page } = await launchEdge(options);
+  const { page } = await getSharedBrowser(options);
 
   try {
     const visited = new Set<string>();
     return await extractSingleTicketContext(page, ticketId, baseUrl, visited);
   } finally {
     if (!options.keepOpen) {
-      await context.close();
+      await closeSharedBrowser();
     }
   }
 }
@@ -1648,7 +1679,8 @@ export async function addTimeEntriesViaUi(
   const debug = options.debug ?? false;
   const retries = Math.max(1, options.retryAttempts ?? 2);
 
-  const { context, page } = await launchEdge(options);
+  const { page } = await getSharedBrowser(options);
+
   try {
     await ensureOnEditTimePage(page, baseUrl);
 
@@ -1660,7 +1692,7 @@ export async function addTimeEntriesViaUi(
     return { success: results.every((r) => r.success), results };
   } finally {
     if (!options.keepOpen) {
-      await context.close();
+      await closeSharedBrowser();
     }
   }
 }
