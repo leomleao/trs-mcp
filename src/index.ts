@@ -1,7 +1,9 @@
+#!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { addTimeEntriesViaUi, getMyWorklistViaUi, getTicketContextViaUi } from "./trs-ui-automation.js";
+import type { TicketContext } from "./trs-ui-automation.js";
 import { autoLearnAlias, resolveBookingSelection } from "./trs-ticket-mappings.js";
 
 const TRS_BASE_URL = process.env.TRS_BASE_URL ?? "https://portal.theconfigteam.co.uk/api";
@@ -42,6 +44,16 @@ interface TimesheetEntryResult {
   entry_id?: string;
   error?: string;
 }
+
+type SerializedTicketContext = Record<string, unknown> & {
+  ticket_id: string;
+  url: string;
+  general: TicketContext["general"];
+  comments: TicketContext["comments"];
+  time: TicketContext["time"];
+  web_links: TicketContext["webLinks"];
+  linked_tickets: SerializedTicketContext[];
+};
 
 interface TrsApiErrorBody {
   message?: string;
@@ -275,6 +287,18 @@ function formatToolError(message: string) {
   };
 }
 
+function serializeTicketContext(ticketContext: TicketContext): SerializedTicketContext {
+  return {
+    ticket_id: ticketContext.ticketId,
+    url: ticketContext.url,
+    general: ticketContext.general,
+    comments: ticketContext.comments,
+    time: ticketContext.time,
+    web_links: ticketContext.webLinks,
+    linked_tickets: ticketContext.linkedTickets.map(serializeTicketContext),
+  };
+}
+
 const server = new McpServer({
   name: "trs-ticketing",
   version: "1.0.0",
@@ -408,15 +432,7 @@ server.registerTool(
         keepOpen: false,
       });
 
-      const data = {
-        ticket_id: ticketContext.ticketId,
-        url: ticketContext.url,
-        general: ticketContext.general,
-        comments: ticketContext.comments,
-        time: ticketContext.time,
-        web_links: ticketContext.webLinks,
-        linked_tickets: ticketContext.linkedTickets,
-      };
+      const data = serializeTicketContext(ticketContext);
 
       return {
         content: [

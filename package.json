@@ -1,10 +1,10 @@
 {
   "name": "trs-mcp",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "./build/index.js",
   "type": "module",
   "bin": {
-    "trs-ticketing": "./build/index.js"
+    "trs-mcp": "./build/index.js"
   },
   "scripts": {
     "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\""

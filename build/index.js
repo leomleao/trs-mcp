@@ -1,0 +1,361 @@
+#!/usr/bin/env node
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import { addTimeEntriesViaUi, getMyWorklistViaUi, getTicketContextViaUi } from "./trs-ui-automation.js";
+import { autoLearnAlias, resolveBookingSelection } from "./trs-ticket-mappings.js";
+const TRS_BASE_URL = process.env.TRS_BASE_URL ?? "https://portal.theconfigteam.co.uk/api";
+const TRS_USER_AGENT = "trs-mcp-server/1.0";
+class TrsApiError extends Error {
+    status;
+    context;
+    constructor(message, status, context) {
+        super(message);
+        this.status = status;
+        this.context = context;
+        this.name = "TrsApiError";
+    }
+}
+class TrsHttpClient {
+    baseUrl;
+    constructor(baseUrl) {
+        this.baseUrl = baseUrl;
+    }
+    async post(path, authContext, body) {
+        return this.request("POST", path, authContext, body);
+    }
+    async request(method, path, authContext, body) {
+        const url = new URL(path, `${this.baseUrl}/`);
+        const headers = {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": TRS_USER_AGENT,
+        };
+        if (authContext.token) {
+            headers.Authorization = `Bearer ${authContext.token}`;
+        }
+        const response = await fetch(url, {
+            method,
+            headers,
+            body: body ? JSON.stringify(body) : undefined,
+        });
+        if (!response.ok) {
+            let errorDetail = `${response.status} ${response.statusText}`;
+            try {
+                const errorJson = (await response.json());
+                errorDetail = errorJson.message ?? errorJson.error ?? errorDetail;
+            }
+            catch {
+                // Ignore JSON parse failures and fall back to status text.
+            }
+            throw new TrsApiError(`TRS API request failed: ${errorDetail}`, response.status, {
+                method,
+                path,
+            });
+        }
+        if (response.status === 204) {
+            return undefined;
+        }
+        return (await response.json());
+    }
+}
+const trsClient = new TrsHttpClient(TRS_BASE_URL);
+function shouldUseUiAutomation(authContext) {
+    return (process.env.TRS_USE_UI_AUTOMATION === "1" ||
+        process.env.TRS_ALWAYS_USE_UI === "1" ||
+        !authContext.token);
+}
+function resolveAuthContext() {
+    return {
+        userId: process.env.TRS_USER_ID,
+        token: process.env.TRS_API_TOKEN,
+    };
+}
+function requireCurrentUserId(authContext) {
+    if (!authContext.userId) {
+        throw new TrsApiError("No TRS user context is configured. Set TRS_USER_ID or wire request-scoped identity into resolveAuthContext().");
+    }
+    return authContext.userId;
+}
+function todayIsoDate() {
+    return new Date().toISOString().slice(0, 10);
+}
+async function resolveTimesheetEntries(entries) {
+    return Promise.all(entries.map(async (entry) => {
+        const resolution = await resolveBookingSelection(entry.ticket_id, entry.description);
+        return {
+            ...entry,
+            ticket_id: resolution?.ticketCode ?? entry.ticket_id,
+            booking_mode: resolution?.mode ?? entry.booking_mode,
+            resolved_booking: resolution
+                ? {
+                    ticket_code: resolution.ticketCode,
+                    booking_mode: resolution.mode,
+                    title: resolution.title ?? null,
+                    confidence: resolution.confidence,
+                    matched_alias: resolution.matchedAlias ?? null,
+                    source: resolution.source,
+                }
+                : null,
+        };
+    }));
+}
+async function trsAddTimesheetEntries(userId, entries, authContext) {
+    const useUiAutomation = shouldUseUiAutomation(authContext);
+    if (useUiAutomation) {
+        const uiResult = await addTimeEntriesViaUi(entries.map((entry) => ({
+            ticketId: entry.ticket_id,
+            date: entry.date,
+            hours: entry.hours,
+            description: entry.description,
+        })), {
+            baseUrl: TRS_BASE_URL.replace(/\/api\/?$/, ""),
+            keepOpen: false,
+        });
+        return {
+            success: uiResult.success,
+            results: uiResult.results.map((r) => ({
+                ticket_id: r.entry.ticketId,
+                date: r.entry.date,
+                hours: r.entry.hours,
+                success: r.success,
+                error: r.error,
+            })),
+        };
+    }
+    const results = await Promise.all(entries.map(async (entry) => {
+        try {
+            const response = await trsClient.post("timesheets/entries", authContext, {
+                user_id: userId,
+                ticket_id: entry.ticket_id,
+                work_date: entry.date,
+                hours: entry.hours,
+                description: entry.description,
+            });
+            return {
+                ticket_id: entry.ticket_id,
+                date: entry.date,
+                hours: entry.hours,
+                success: true,
+                entry_id: response.id,
+            };
+        }
+        catch (error) {
+            console.error("Failed to add TRS timesheet entry", {
+                ticketId: entry.ticket_id,
+                date: entry.date,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            return {
+                ticket_id: entry.ticket_id,
+                date: entry.date,
+                hours: entry.hours,
+                success: false,
+                error: error instanceof Error ? error.message : "Unknown error",
+            };
+        }
+    }));
+    return {
+        success: results.every((result) => result.success),
+        results,
+    };
+}
+function formatToolResult(data, summary) {
+    return {
+        content: [
+            {
+                type: "text",
+                text: summary,
+            },
+        ],
+        structuredContent: data,
+    };
+}
+function formatToolError(message) {
+    return {
+        content: [
+            {
+                type: "text",
+                text: message,
+            },
+        ],
+        isError: true,
+    };
+}
+function serializeTicketContext(ticketContext) {
+    return {
+        ticket_id: ticketContext.ticketId,
+        url: ticketContext.url,
+        general: ticketContext.general,
+        comments: ticketContext.comments,
+        time: ticketContext.time,
+        web_links: ticketContext.webLinks,
+        linked_tickets: ticketContext.linkedTickets.map(serializeTicketContext),
+    };
+}
+const server = new McpServer({
+    name: "trs-ticketing",
+    version: "1.0.0",
+});
+const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected an ISO date in YYYY-MM-DD format.");
+server.registerTool("book_time_from_activity", {
+    title: "Book Time From Activity",
+    description: "Book a single TRS timesheet entry from a natural-language activity description such as 'inbox and ticket management'. The server resolves the booking code automatically using the seeded and custom alias mappings.",
+    inputSchema: {
+        activity: z
+            .string()
+            .min(1)
+            .describe("Natural-language activity to book time against, such as 'inbox and ticket management'."),
+        hours: z.number().positive().describe("Number of hours to book."),
+        date: isoDateSchema
+            .optional()
+            .describe("Optional work date in YYYY-MM-DD format. Defaults to today's date if omitted."),
+        comment: z
+            .string()
+            .optional()
+            .describe("Optional comment to store in TRS. Defaults to the activity text when omitted."),
+        ticket_id: z
+            .string()
+            .optional()
+            .describe("Optional explicit ticket code. Leave blank to let the alias resolver choose automatically."),
+        auto_learn_alias: z
+            .boolean()
+            .default(true)
+            .describe("When true, a successful booking can save the activity phrase as a reusable custom alias if it is not already known."),
+    },
+}, async ({ activity, hours, date, comment, ticket_id, auto_learn_alias }) => {
+    try {
+        const authContext = resolveAuthContext();
+        const userId = shouldUseUiAutomation(authContext)
+            ? authContext.userId ?? "ui-session"
+            : requireCurrentUserId(authContext);
+        const entryDate = date ?? todayIsoDate();
+        const entryDescription = comment?.trim() || activity;
+        const resolvedEntries = await resolveTimesheetEntries([
+            {
+                ticket_id: ticket_id?.trim() ?? "",
+                date: entryDate,
+                hours,
+                description: entryDescription,
+            },
+        ]);
+        const result = await trsAddTimesheetEntries(userId, resolvedEntries.map((entry) => ({
+            ticket_id: entry.ticket_id,
+            date: entry.date,
+            hours: entry.hours,
+            description: entry.description,
+            booking_mode: entry.booking_mode,
+        })), authContext);
+        const learnedAlias = result.success && auto_learn_alias && resolvedEntries[0].resolved_booking
+            ? await autoLearnAlias(activity, {
+                mode: resolvedEntries[0].resolved_booking.booking_mode,
+                ticketCode: resolvedEntries[0].resolved_booking.ticket_code,
+                title: resolvedEntries[0].resolved_booking.title ?? undefined,
+                aliases: [],
+                confidence: resolvedEntries[0].resolved_booking.confidence,
+                matchedAlias: resolvedEntries[0].resolved_booking.matched_alias ?? undefined,
+                source: resolvedEntries[0].resolved_booking.source,
+            }, "Auto-learned from a successful natural-language booking.")
+            : null;
+        return formatToolResult({
+            user_id: userId,
+            activity,
+            success: result.success,
+            resolved_entry: {
+                ticket_id: resolvedEntries[0].ticket_id,
+                date: resolvedEntries[0].date,
+                hours: resolvedEntries[0].hours,
+                description: resolvedEntries[0].description,
+                resolved_booking: resolvedEntries[0].resolved_booking,
+            },
+            learned_alias: learnedAlias
+                ? {
+                    created: learnedAlias.created,
+                    alias: learnedAlias.alias,
+                    ticket_code: learnedAlias.ticketCode,
+                    booking_mode: learnedAlias.bookingMode,
+                    title: learnedAlias.title ?? null,
+                }
+                : null,
+            result: result.results[0] ?? null,
+        }, result.success
+            ? learnedAlias?.created
+                ? `Booked ${hours} hour${hours === 1 ? "" : "s"} for '${activity}' on ${entryDate}, and learned '${activity}' as a reusable alias.`
+                : `Booked ${hours} hour${hours === 1 ? "" : "s"} for '${activity}' on ${entryDate}.`
+            : `Tried to book ${hours} hour${hours === 1 ? "" : "s"} for '${activity}' on ${entryDate}, but TRS reported a failure.`);
+    }
+    catch (error) {
+        console.error("Failed to book TRS time from activity", {
+            activity,
+            error: error instanceof Error ? error.message : String(error),
+        });
+        return formatToolError(error instanceof Error ? error.message : "Failed to book TRS time from activity.");
+    }
+});
+server.registerTool("get_ticket_context", {
+    title: "Get Ticket Context",
+    description: "Retrieve general information, comments, time entries, web/document links, and linked tickets from a TRS ticket by navigating to the ticket page. Returns structured data including title, details, priority, client info, full comment history, and any SharePoint document links attached to the ticket.",
+    inputSchema: {
+        ticket_id: z.string().min(1).describe("The ticket ID, e.g. TCTEVI-7343"),
+    },
+}, async ({ ticket_id }) => {
+    try {
+        const ticketContext = await getTicketContextViaUi(ticket_id.trim(), {
+            baseUrl: TRS_BASE_URL.replace(/\/api\/?$/, ""),
+            keepOpen: false,
+        });
+        const data = serializeTicketContext(ticketContext);
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify(data, null, 2),
+                },
+            ],
+            structuredContent: data,
+        };
+    }
+    catch (error) {
+        console.error("Failed to get ticket context", {
+            ticketId: ticket_id,
+            error: error instanceof Error ? error.message : String(error),
+        });
+        return formatToolError(error instanceof Error ? error.message : "Failed to get ticket context.");
+    }
+});
+server.registerTool("get_my_worklist", {
+    title: "Get My Worklist",
+    description: "Run the 'My Worklist' report in TRS and return all tickets currently assigned to or owned by the current user. Returns structured data including ticket ID, client, priority, status, type, dates, owner, and module.",
+    inputSchema: {},
+}, async () => {
+    try {
+        const items = await getMyWorklistViaUi({
+            baseUrl: TRS_BASE_URL.replace(/\/api\/?$/, ""),
+            keepOpen: false,
+        });
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify(items, null, 2),
+                },
+            ],
+            structuredContent: { items },
+        };
+    }
+    catch (error) {
+        console.error("Failed to get My Worklist", {
+            error: error instanceof Error ? error.message : String(error),
+        });
+        return formatToolError(error instanceof Error ? error.message : "Failed to get My Worklist.");
+    }
+});
+async function main() {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("TRS MCP Server running on stdio");
+}
+main().catch((error) => {
+    console.error("Fatal error in main():", error);
+    process.exit(1);
+});

@@ -1,9 +1,9 @@
 node_modules/
-build/
 
 .env
 .env.*
 !.env.example
+.claude/*
 
 npm-debug.log*
 yarn-debug.log*
@@ -19,3 +19,4 @@ test-results/
 
 coverage/
 *.tsbuildinfo
+
